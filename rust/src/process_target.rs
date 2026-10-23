@@ -11,13 +11,13 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 // ---------------------------------------------------------------- Data models
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum SocketProtocol {
     Tcp,
     Udp,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ProcessSocket {
     pub protocol: SocketProtocol,
     pub local_port: u16,
@@ -421,7 +421,7 @@ pub fn build_filter_for_sockets(
         (true, true) => "(inbound or outbound)",
         (true, false) => "inbound",
         (false, true) => "outbound",
-        (false, false) => "(inbound or outbound)",
+        (false, false) => return "false".to_string(),
     };
 
     let mut port_clauses: Vec<String> = Vec::new();
@@ -433,8 +433,9 @@ pub fn build_filter_for_sockets(
         port_clauses.push(format!("udp.SrcPort == {p} or udp.DstPort == {p}"));
     }
 
+    // An empty process selection must never expand to system-wide capture.
     if port_clauses.is_empty() {
-        return dir.to_string();
+        return "false".to_string();
     }
 
     format!("{dir} and ({})", port_clauses.join(" or "))
@@ -451,6 +452,17 @@ mod tests {
         let has_sockets = procs.iter().any(|p| !p.sockets.is_empty());
         println!("Total processes: {}, Has processes with sockets: {}", procs.len(), has_sockets);
         assert!(has_sockets, "At least one process should have active sockets");
+    }
+
+    #[test]
+    fn empty_target_does_not_capture_unrelated_traffic() {
+        assert_eq!(build_filter_for_sockets(&[], true, true, true, true), "false");
+        let socket = ProcessSocket {
+            protocol: SocketProtocol::Tcp, local_port: 8080, remote_port: 0,
+            remote_addr: String::new(), state: String::new(),
+        };
+        assert_eq!(build_filter_for_sockets(&[socket.clone()], false, true, true, true), "false");
+        assert_eq!(build_filter_for_sockets(&[socket], true, true, false, false), "false");
     }
 
     #[test]

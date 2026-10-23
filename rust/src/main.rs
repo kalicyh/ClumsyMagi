@@ -6,6 +6,7 @@ mod cli;
 mod config;
 mod engine;
 mod icon;
+mod mcp;
 mod packet;
 mod platform;
 mod process_target;
@@ -30,6 +31,14 @@ fn load_icon() -> egui::IconData {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.iter().any(|a| a == "--mcp") {
+        if let Err(e) = mcp::bridge(&args) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if args.iter().any(|a| a == "--selftest") {
         std::process::exit(if selftest::run() { 0 } else { 1 });

@@ -90,6 +90,66 @@ clumsymagi --show-console
 clumsymagi --window-pos 400,200
 ```
 
+### MCP Automation (AI Control)
+
+The **MCP Automation** group in the desktop window controls AI access to that same
+window's filtering engine. It uses the existing theme, grouped controls and status
+colors. No separate filtering instance is launched.
+
+1. Open ClumsyMagi (as Administrator for packet capture).
+2. Click **Enable** under **MCP Automation**. The status changes to **Running** only
+   after the local listener starts successfully.
+3. Click **Copy Config** and paste the JSON into a client that supports the
+   `mcpServers` configuration format and stdio servers. Clients with a different
+   settings format need the same `command`, `args` and `env` values.
+4. Keep the window open. Ask the AI to select a process or set a filter, configure
+   modules, and start a timed test.
+5. Click **Disable** to revoke access and stop an AI-started filtering run. A run
+   started manually in the GUI is not stopped by disabling MCP.
+
+The service is **off on every application launch**. Its local port (default 39761)
+can be edited while disabled. Port and access token are saved with the application's
+configuration, so copied settings remain usable across restarts at the same
+executable path. Enable the service again before reconnecting the client. After
+changing the port or moving the executable, copy the configuration again. If a
+client disconnected while MCP was disabled, reconnect/restart its server entry.
+The copied configuration contains an access token; treat it as a credential.
+
+The client starts `clumsymagi.exe --mcp --mcp-port <PORT>` as a stdio bridge, with
+`CLUMSYMAGI_MCP_TOKEN` in its environment. This mode bypasses GUI initialization and
+the single-instance check, and forwards newline-delimited JSON-RPC messages over an
+authenticated, loopback-only connection. It does not open another window or require
+Node.js/Python. The internal TCP port is not an HTTP MCP endpoint.
+See the [MCP stdio transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports).
+
+Available tools:
+
+| Tool | Purpose |
+| :--- | :--- |
+| `get_status` | Live module configuration, active filter, target, driver/admin state and remaining test time |
+| `list_processes`, `get_process_sockets` | Paginated process and socket discovery |
+| `validate_filter`, `set_filter`, `set_target` | Validate expressions or select capture scope while stopped |
+| `configure_module` | Enable/disable and tune all eight modules; omitted parameters stay unchanged |
+| `start` | Start with a required `duration_secs` deadline (1–3600 seconds) |
+| `stop` | Stop capture and return final counters |
+| `get_stats`, `get_logs` | Current/last-run counters and the latest 100 log entries |
+| `reset_next` | Queue a TCP reset while the Reset module and capture are enabled |
+
+Module names are `lag`, `drop`, `throttle`, `duplicate`, `ood`, `tamper`, `reset`
+and `bandwidth`. Tool schemas describe accepted fields and ranges; invalid inputs
+are rejected before applying a module update. MCP parameter changes use the same
+live parameters and persistence as manual GUI edits. Multi-field updates are not
+an atomic packet-processing transaction.
+
+An AI-started test stops when its deadline is processed by the GUI, when MCP is
+disabled, or when the window closes normally. Disconnecting an AI client leaves
+the test running until its deadline. Process tracking retains the deadline when
+ports change; it stops capture if the target has no active sockets. Process
+selection generates port-based filters and is not strict process isolation when
+ports are shared. Statistics describe the current engine instance (a port-change
+restart resets counters), not an aggregate across multiple instances. Business
+request assertions still need a separate application test runner.
+
 ### Command Line Options
 
 | Option | Description |

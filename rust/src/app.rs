@@ -2,6 +2,8 @@
 //! module rows, elevation banner, live event log + throughput graph,
 //! dark/light/system themes, persisted config.
 
+mod mcp;
+
 use crate::config::{AppConfig, Theme};
 use crate::engine::modules::ModuleKind;
 use crate::engine::params::ModuleParams;
@@ -66,6 +68,11 @@ pub struct ClumsyMagiApp {
     pub target_filter_outbound: bool,
     pub last_auto_track_check: Instant,
     pub only_games_tab: bool,
+    mcp: Option<crate::mcp::Server>,
+    mcp_error: Option<String>,
+    mcp_copied_at: Option<Instant>,
+    mcp_deadline: Option<Instant>,
+    final_stats: StatsSnapshot,
 }
 
 impl ClumsyMagiApp {
@@ -119,6 +126,11 @@ impl ClumsyMagiApp {
             target_filter_outbound: true,
             last_auto_track_check: Instant::now(),
             only_games_tab: true,
+            mcp: None,
+            mcp_error: None,
+            mcp_copied_at: None,
+            mcp_deadline: None,
+            final_stats: StatsSnapshot::default(),
         }
     }
 
@@ -128,6 +140,15 @@ impl ClumsyMagiApp {
     }
 
     pub fn start_filtering(&mut self) {
+        if self.engine.is_some() {
+            return;
+        }
+        if let Some(pid) = self.target_pid {
+            if crate::process_target::get_sockets_for_pid(pid).is_empty() {
+                self.set_status("Target has no active sockets; filtering was not started.", true);
+                return;
+            }
+        }
         let Some(lib) = self.lib.clone() else {
             self.set_status(
                 self.lib_load_error
@@ -154,8 +175,11 @@ impl ClumsyMagiApp {
     }
 
     fn stop_filtering(&mut self) {
+        self.mcp_deadline = None;
         if let Some(engine) = self.engine.take() {
             engine.stop();
+            self.final_stats = engine.shared.stats.snapshot();
+            self.log_cache = engine.shared.log.snapshot();
             self.set_status("Stopped. To begin again, edit criteria and click Start.", false);
         }
     }
@@ -208,6 +232,11 @@ impl ClumsyMagiApp {
     pub fn update_target_filter(&mut self, force_restart: bool) {
         let Some(pid) = self.target_pid else { return; };
         let sockets = crate::process_target::get_sockets_for_pid(pid);
+        if sockets.is_empty() {
+            self.stop_filtering();
+            self.set_status("Target has no active sockets; filtering stopped.", true);
+            return;
+        }
         let new_filter = crate::process_target::build_filter_for_sockets(
             &sockets,
             self.target_filter_tcp,
@@ -221,8 +250,12 @@ impl ClumsyMagiApp {
             self.mark_dirty();
             self.preset_selected = usize::MAX;
             if self.engine.as_ref().map(|e| e.is_running()).unwrap_or(false) {
+                let deadline = self.mcp_deadline;
                 self.stop_filtering();
                 self.start_filtering();
+                if self.engine.is_some() {
+                    self.mcp_deadline = deadline;
+                }
             }
         }
     }
@@ -299,6 +332,11 @@ impl eframe::App for ClumsyMagiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        self.poll_mcp();
+        if self.mcp_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            self.stop_filtering();
+        }
+
         // theme (updates visuals and preferences when theme or system dark mode changes)
         self.apply_theme(&ctx);
 
@@ -352,6 +390,7 @@ impl eframe::App for ClumsyMagiApp {
 
 impl Drop for ClumsyMagiApp {
     fn drop(&mut self) {
+        self.mcp.take();
         self.stop_filtering();
         self.maybe_save_config(true);
     }
@@ -363,6 +402,8 @@ impl ClumsyMagiApp {
 
         // 1. Filtering Section
         self.ui_filtering_section(ui);
+
+        self.ui_mcp_section(ui);
 
         // 2. Functions Section
         self.ui_functions_section(ui);

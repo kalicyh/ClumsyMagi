@@ -193,6 +193,14 @@ pub struct AppConfig {
     /// start filtering immediately on launch (also set by --auto-start)
     pub auto_start: bool,
     pub show_log: bool,
+    #[serde(default = "default_mcp_port")]
+    pub mcp_port: u16,
+    #[serde(default)]
+    pub mcp_token: String,
+}
+
+fn default_mcp_port() -> u16 {
+    39761
 }
 
 impl Default for AppConfig {
@@ -204,6 +212,8 @@ impl Default for AppConfig {
             modules: Default::default(),
             auto_start: false,
             show_log: true,
+            mcp_port: default_mcp_port(),
+            mcp_token: String::new(),
         }
     }
 }
