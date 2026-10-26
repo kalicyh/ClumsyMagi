@@ -14,7 +14,7 @@
   - Live activity log with timestamped entries, copy-to-clipboard, and clear functionality.
   - Real-time activity indicator dots (green = active traffic, red = send failure, gray = idle) per module and globally.
 - **Full Clumsy 0.3 Feature Parity**:
-  - **Lag**: Delays packets (0–15,000 ms) with direction filtering (inbound/outbound/both) and ring-buffer overflow safety.
+  - **Lag**: Delays packets (0–15,000 ms) with direction filtering (inbound/outbound/both). The queue grows as needed without releasing packets early; memory usage increases with traffic rate and delay.
   - **Drop**: Drops packets with configurable percentage chance (0–100%).
   - **Throttle**: Holds packets over a timeframe (0–1,000 ms), then flushes or drops them together.
   - **Duplicate**: Clones matching packets (2–50 copies) with percentage chance.

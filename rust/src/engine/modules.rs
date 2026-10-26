@@ -11,10 +11,6 @@ use crate::packet::{calc_checksums, parse, set_rst_flag, Packet, PacketView, PRO
 
 // ---------------------------------------------------------------- constants
 
-/// C lag.c: KEEP_AT_MOST
-pub const LAG_KEEP_AT_MOST: usize = 2000;
-/// C lag.c: FLUSH_WHEN_FULL
-pub const LAG_FLUSH_WHEN_FULL: usize = 800;
 /// C throttle.c: KEEP_AT_MOST
 pub const THROTTLE_KEEP_AT_MOST: usize = 1000;
 /// C ood.c: KEEP_TURNS_MAX
@@ -309,19 +305,18 @@ impl ModuleState {
     fn lag_process(&mut self, params: &ModuleParams, ctx: &mut StepCtx) -> bool {
         let delay = params.delay_ms.load(std::sync::atomic::Ordering::Relaxed).max(0) as u64;
 
-        // capture matching packets into the buffer (until full), keep the rest
-        if self.lag_buf.len() < LAG_KEEP_AT_MOST {
-            let mut remaining = std::collections::VecDeque::with_capacity(ctx.queue.len());
-            for mut p in ctx.queue.drain(..) {
-                if self.lag_buf.len() < LAG_KEEP_AT_MOST && direction_matches(params, p.outbound()) {
-                    p.due_ms = ctx.now_ms;
-                    self.lag_buf.push_back(p);
-                } else {
-                    remaining.push_back(p);
-                }
+        // NOTE: Unlike C lag.c, let the buffer grow so high packet rates do not
+        // force packets out before their configured delay.
+        let mut remaining = std::collections::VecDeque::with_capacity(ctx.queue.len());
+        for mut p in ctx.queue.drain(..) {
+            if direction_matches(params, p.outbound()) {
+                p.due_ms = ctx.now_ms;
+                self.lag_buf.push_back(p);
+            } else {
+                remaining.push_back(p);
             }
-            *ctx.queue = remaining;
         }
+        *ctx.queue = remaining;
 
         // release overdue packets, oldest first
         let mut released = 0usize;
@@ -332,27 +327,6 @@ impl ModuleState {
                 released += 1;
             } else {
                 break;
-            }
-        }
-
-        // buffer full: flush the oldest FLUSH_WHEN_FULL packets to keep going
-        let mut flushed = 0usize;
-        if self.lag_buf.len() >= LAG_KEEP_AT_MOST {
-            for _ in 0..LAG_FLUSH_WHEN_FULL {
-                match self.lag_buf.pop_front() {
-                    Some(p) => {
-                        ctx.queue.push_back(p);
-                        flushed += 1;
-                    }
-                    None => break,
-                }
-            }
-            if flushed > 0 {
-                ctx.event(
-                    ModuleKind::Lag,
-                    EventImportance::Summary,
-                    format!("buffer full, flushed {flushed} packets"),
-                );
             }
         }
 
@@ -802,19 +776,19 @@ mod tests {
     }
 
     #[test]
-    fn lag_buffer_overflow_flushes_oldest() {
+    fn lag_buffer_grows_without_early_release() {
         let params = ModuleParams::new(ModuleKind::Lag);
         params.delay_ms.store(1000, Ordering::Relaxed);
         let mut state = ModuleState::default();
         let mut rng = Rng::new(1);
-        let mut q: VecDeque<Packet> = (0..LAG_KEEP_AT_MOST + 5).map(|_| udp_packet(true)).collect();
+        let packet_count = 2005;
+        let mut q: VecDeque<Packet> = (0..packet_count).map(|_| udp_packet(true)).collect();
         {
             let mut c = ctx(&mut q, 0, &mut rng);
             state.process(ModuleKind::Lag, &params, &mut c);
         }
-        // buffer capped at 2000; extra 5 remain in queue; 800 oldest flushed into queue
-        assert_eq!(self_lag_len(&state), LAG_KEEP_AT_MOST - LAG_FLUSH_WHEN_FULL);
-        assert_eq!(q.len(), 5 + LAG_FLUSH_WHEN_FULL);
+        assert_eq!(self_lag_len(&state), packet_count);
+        assert!(q.is_empty(), "packets beyond the old cap must also wait for their delay");
     }
 
     fn self_lag_len(state: &ModuleState) -> usize {
