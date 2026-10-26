@@ -4,7 +4,7 @@
 
 mod mcp;
 
-use crate::config::{AppConfig, Theme};
+use crate::config::{AppConfig, AutoStop, Theme};
 use crate::engine::modules::ModuleKind;
 use crate::engine::params::ModuleParams;
 use crate::engine::{EngineHandle, StatsSnapshot};
@@ -71,7 +71,7 @@ pub struct ClumsyMagiApp {
     mcp: Option<crate::mcp::Server>,
     mcp_error: Option<String>,
     mcp_copied_at: Option<Instant>,
-    mcp_deadline: Option<Instant>,
+    mcp_started: bool,
     final_stats: StatsSnapshot,
 }
 
@@ -134,7 +134,7 @@ impl ClumsyMagiApp {
             mcp: None,
             mcp_error: None,
             mcp_copied_at: None,
-            mcp_deadline: None,
+            mcp_started: false,
             final_stats: StatsSnapshot::default(),
         }
     }
@@ -145,7 +145,16 @@ impl ClumsyMagiApp {
     }
 
     pub fn start_filtering(&mut self) {
+        self.start_filtering_until(Instant::now() + self.config.auto_stop.duration());
+    }
+
+    fn start_filtering_until(&mut self, deadline: Instant) {
+        self.finish_stopped_filtering();
         if self.engine.is_some() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            self.set_status("Automatically stopped filtering: time limit reached.", false);
             return;
         }
         if let Some(pid) = self.target_pid {
@@ -166,7 +175,7 @@ impl ClumsyMagiApp {
         let filter = self.mcp.as_ref().map(|server| crate::mcp::capture_filter(&self.config.filter, server.port))
             .unwrap_or_else(|| self.config.filter.clone());
         let params = self.params.clone();
-        match EngineHandle::start(lib, &filter, params) {
+        match EngineHandle::start(lib, &filter, params, deadline) {
             Ok(engine) => {
                 self.set_status(
                     "Started filtering. Enable functionalities to take effect.",
@@ -181,12 +190,36 @@ impl ClumsyMagiApp {
     }
 
     fn stop_filtering(&mut self) {
-        self.mcp_deadline = None;
+        self.mcp_started = false;
         if let Some(engine) = self.engine.take() {
             engine.stop();
             self.final_stats = engine.shared.stats.snapshot();
             self.log_cache = engine.shared.log.snapshot();
             self.set_status("Stopped. To begin again, edit criteria and click Start.", false);
+        }
+    }
+
+    fn finish_stopped_filtering(&mut self) {
+        if let Some(engine) = &self.engine {
+            if !engine.is_running() {
+                let timed_out = engine.did_timeout();
+                self.stop_filtering();
+                if timed_out {
+                    self.set_status("Automatically stopped filtering: time limit reached.", false);
+                }
+            }
+        }
+    }
+
+    fn restart_filtering(&mut self) {
+        self.finish_stopped_filtering();
+        let Some(engine) = &self.engine else { return; };
+        let deadline = engine.deadline();
+        let mcp_started = self.mcp_started;
+        self.stop_filtering();
+        self.start_filtering_until(deadline);
+        if self.engine.is_some() {
+            self.mcp_started = mcp_started;
         }
     }
 
@@ -256,12 +289,7 @@ impl ClumsyMagiApp {
             self.mark_dirty();
             self.preset_selected = usize::MAX;
             if self.engine.as_ref().map(|e| e.is_running()).unwrap_or(false) {
-                let deadline = self.mcp_deadline;
-                self.stop_filtering();
-                self.start_filtering();
-                if self.engine.is_some() {
-                    self.mcp_deadline = deadline;
-                }
+                self.restart_filtering();
             }
         }
     }
@@ -338,10 +366,8 @@ impl eframe::App for ClumsyMagiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        self.finish_stopped_filtering();
         self.poll_mcp();
-        if self.mcp_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            self.stop_filtering();
-        }
 
         // theme (updates visuals and preferences when theme or system dark mode changes)
         self.apply_theme(&ctx);
@@ -670,6 +696,26 @@ impl ClumsyMagiApp {
                         self.preset_name_edit.clear();
                     }
                 });
+            });
+
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!running, |ui| {
+                    ui.label("Auto-stop after:");
+                    egui::ComboBox::from_id_salt("auto_stop")
+                        .selected_text(self.config.auto_stop.label())
+                        .show_ui(ui, |ui| {
+                            for duration in [AutoStop::FiveMinutes, AutoStop::TenMinutes] {
+                                if ui.selectable_value(&mut self.config.auto_stop, duration, duration.label()).changed() {
+                                    self.mark_dirty();
+                                }
+                            }
+                        });
+                });
+                if let Some(engine) = &self.engine {
+                    let remaining = engine.deadline().saturating_duration_since(Instant::now());
+                    let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+                    ui.label(format!("Stops in {}:{:02}", seconds / 60, seconds % 60));
+                }
             });
 
             // Filter Text Edit: full width

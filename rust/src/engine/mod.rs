@@ -18,7 +18,7 @@ use params::ModuleParams;
 use rng::Rng;
 use std::collections::VecDeque;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -138,6 +138,52 @@ pub fn unix_ms() -> u64 {
 
 // ---------------------------------------------------------------- shared state
 
+const STOP_NONE: u8 = 0;
+const STOP_MANUAL: u8 = 1;
+const STOP_DEADLINE: u8 = 2;
+
+struct StopState {
+    deadline: Instant,
+    reason: AtomicU8,
+}
+
+impl StopState {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            reason: AtomicU8::new(STOP_NONE),
+        }
+    }
+
+    fn request_stop(&self) {
+        let _ = self.reason.compare_exchange(
+            STOP_NONE,
+            STOP_MANUAL,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    fn check_deadline(&self, now: Instant) {
+        if now >= self.deadline {
+            let _ = self.reason.compare_exchange(
+                STOP_NONE,
+                STOP_DEADLINE,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    fn is_requested(&self) -> bool {
+        self.reason.load(Ordering::SeqCst) != STOP_NONE
+    }
+
+    fn did_timeout(&self) -> bool {
+        self.reason.load(Ordering::SeqCst) == STOP_DEADLINE
+    }
+}
+
 struct EngineQueue {
     queue: VecDeque<Packet>,
     states: Vec<ModuleState>,
@@ -171,7 +217,8 @@ pub struct EngineShared {
     pub send_ok_ms: AtomicU64,
     pub send_fail_ms: AtomicU64,
     pub running: AtomicBool,
-    stopping: AtomicBool,
+    stop_state: StopState,
+    recv_finished: AtomicBool,
     handle: AtomicPtr<std::ffi::c_void>,
     queue: Mutex<EngineQueue>,
 }
@@ -343,6 +390,7 @@ impl EngineHandle {
         lib: Arc<WinDivertLib>,
         filter: &str,
         params: Vec<Arc<ModuleParams>>,
+        deadline: Instant,
     ) -> Result<EngineHandle, String> {
         if let Err(e) = lib.compile_filter(filter) {
             return Err(e);
@@ -365,7 +413,8 @@ impl EngineHandle {
             send_ok_ms: AtomicU64::new(0),
             send_fail_ms: AtomicU64::new(0),
             running: AtomicBool::new(true),
-            stopping: AtomicBool::new(false),
+            stop_state: StopState::new(deadline),
+            recv_finished: AtomicBool::new(false),
             handle: AtomicPtr::new(handle),
             queue: Mutex::new(EngineQueue::new(module_count)),
         });
@@ -377,16 +426,32 @@ impl EngineHandle {
             level: LogLevel::Info,
         });
 
-        let recv_shared = shared.clone();
         let clock_shared = shared.clone();
-        let recv = std::thread::Builder::new()
-            .name("clumsymagi-recv".into())
-            .spawn(move || recv_loop(recv_shared))
-            .map_err(|e| format!("failed to spawn recv thread: {e}"))?;
-        let clock = std::thread::Builder::new()
+        let clock = match std::thread::Builder::new()
             .name("clumsymagi-clock".into())
             .spawn(move || clock_loop(clock_shared))
-            .map_err(|e| format!("failed to spawn clock thread: {e}"))?;
+        {
+            Ok(thread) => thread,
+            Err(e) => {
+                shared.stop_state.request_stop();
+                shared.recv_finished.store(true, Ordering::SeqCst);
+                finish_stop(&shared);
+                return Err(format!("failed to spawn clock thread: {e}"));
+            }
+        };
+        let recv_shared = shared.clone();
+        let recv = match std::thread::Builder::new()
+            .name("clumsymagi-recv".into())
+            .spawn(move || recv_loop(recv_shared))
+        {
+            Ok(thread) => thread,
+            Err(e) => {
+                shared.stop_state.request_stop();
+                shared.recv_finished.store(true, Ordering::SeqCst);
+                let _ = clock.join();
+                return Err(format!("failed to spawn recv thread: {e}"));
+            }
+        };
 
         Ok(EngineHandle {
             shared,
@@ -396,31 +461,23 @@ impl EngineHandle {
     }
 
     /// Stop filtering: flush module buffers, send everything, close the handle.
-    /// Blocks until both threads have exited (bounded wait).
+    /// Blocks until both worker threads have exited, including after a timeout.
     pub fn stop(&self) {
-        let sh = &self.shared;
-        if !sh.running.swap(false, Ordering::SeqCst) {
-            return;
-        }
-        sh.stopping.store(true, Ordering::SeqCst);
-        let handle = sh.handle.load(Ordering::SeqCst);
-        if !handle.is_null() {
-            // unblock the recv thread
-            sh.lib.shutdown(handle);
-        }
+        self.shared.stop_state.request_stop();
         if let Some(t) = self.recv_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = t.join();
         }
         if let Some(t) = self.clock_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = t.join();
         }
-        crate::platform::end_timer_resolution();
-        sh.log.push(LogEvent {
-            unix_ms: unix_ms(),
-            module: None,
-            text: "Stopped filtering".to_string(),
-            level: LogLevel::Info,
-        });
+    }
+
+    pub fn deadline(&self) -> Instant {
+        self.shared.stop_state.deadline
+    }
+
+    pub fn did_timeout(&self) -> bool {
+        self.shared.stop_state.did_timeout()
     }
 
     pub fn is_running(&self) -> bool {
@@ -436,10 +493,22 @@ impl Drop for EngineHandle {
 
 // ---------------------------------------------------------------- threads
 
+struct RecvFinished<'a>(&'a AtomicBool);
+
+impl Drop for RecvFinished<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 fn recv_loop(shared: Arc<EngineShared>) {
+    let _finished = RecvFinished(&shared.recv_finished);
     let mut buf = vec![0u8; crate::wd::MAX_PACKETSIZE];
     let mut addr_raw = [0u8; crate::wd::WINDIVERT_ADDRESS_SIZE];
     loop {
+        if shared.stop_state.is_requested() {
+            break;
+        }
         let handle = shared.handle.load(Ordering::SeqCst);
         if handle.is_null() {
             break;
@@ -447,7 +516,7 @@ fn recv_loop(shared: Arc<EngineShared>) {
         match shared.lib.recv_on(handle, &mut buf, &mut addr_raw) {
             Ok(len) => {
                 let mut eq = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-                if shared.stopping.load(Ordering::SeqCst) {
+                if shared.stop_state.is_requested() {
                     // user stopped while we were blocked: drop the last packet
                     // (same as clumsy: "Lost last recved packet but user stopped")
                     break;
@@ -481,47 +550,70 @@ fn recv_loop(shared: Arc<EngineShared>) {
     }
 }
 
+fn finish_stop(shared: &EngineShared) {
+    let handle = shared.handle.swap(ptr::null_mut(), Ordering::SeqCst);
+    if handle.is_null() {
+        return;
+    }
+    // Wake blocking Recv before waiting, and close only after it can no longer use this handle.
+    shared.lib.shutdown(handle);
+    while !shared.recv_finished.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut guard = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+    let eq: &mut EngineQueue = &mut guard;
+    // final close-down: flush all module buffers and send everything
+    let now = eq.now_ms();
+    for (ix, kind) in MODULE_ORDER.iter().enumerate() {
+        let params = &shared.params[ix];
+        if params.enabled.load(Ordering::Relaxed) && eq.states[ix].last_enabled {
+            let mut ctx = StepCtx {
+                queue: &mut eq.queue,
+                now_ms: now,
+                rng: &mut eq.rng,
+                events: Vec::new(),
+                dropped: 0,
+                modified: 0,
+            };
+            eq.states[ix].close_down(*kind, params, &mut ctx);
+            for ev in ctx.events {
+                shared.log.push(LogEvent {
+                    unix_ms: unix_ms(),
+                    module: Some(*kind),
+                    text: ev.text,
+                    level: LogLevel::Info,
+                });
+            }
+        }
+    }
+    shared.send_all(handle, eq);
+    drop(guard);
+    shared.lib.close_on(handle);
+    crate::platform::end_timer_resolution();
+    shared.log.push(LogEvent {
+        unix_ms: unix_ms(),
+        module: None,
+        text: if shared.stop_state.did_timeout() {
+            "Automatic stop deadline reached; stopped filtering".to_string()
+        } else {
+            "Stopped filtering".to_string()
+        },
+        level: LogLevel::Info,
+    });
+    shared.running.store(false, Ordering::SeqCst);
+}
+
 fn clock_loop(shared: Arc<EngineShared>) {
     loop {
-        if shared.stopping.load(Ordering::SeqCst) {
-            let handle = shared.handle.swap(ptr::null_mut(), Ordering::SeqCst);
-            if !handle.is_null() {
-                let mut guard = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-                let eq: &mut EngineQueue = &mut guard;
-                // final close-down: flush all module buffers and send everything
-                let now = eq.now_ms();
-                for (ix, kind) in MODULE_ORDER.iter().enumerate() {
-                    let params = &shared.params[ix];
-                    if params.enabled.load(Ordering::Relaxed) && eq.states[ix].last_enabled {
-                        let mut ctx = StepCtx {
-                            queue: &mut eq.queue,
-                            now_ms: now,
-                            rng: &mut eq.rng,
-                            events: Vec::new(),
-                            dropped: 0,
-                            modified: 0,
-                        };
-                        eq.states[ix].close_down(*kind, params, &mut ctx);
-                        for ev in ctx.events {
-                            shared.log.push(LogEvent {
-                                unix_ms: unix_ms(),
-                                module: Some(*kind),
-                                text: ev.text,
-                                level: LogLevel::Info,
-                            });
-                        }
-                    }
-                }
-                shared.send_all(handle, eq);
-                drop(guard);
-                shared.lib.close_on(handle);
-            }
+        shared.stop_state.check_deadline(Instant::now());
+        if shared.stop_state.is_requested() {
+            finish_stop(&shared);
             break;
         }
         let handle = shared.handle.load(Ordering::SeqCst);
         if !handle.is_null() {
             if let Ok(mut eq) = shared.queue.try_lock() {
-                if !shared.stopping.load(Ordering::SeqCst) {
+                if !shared.stop_state.is_requested() {
                     shared.consume_step(&mut eq);
                     shared.send_all(handle, &mut eq);
                 }
@@ -541,6 +633,30 @@ pub fn all_modules() -> &'static [ModuleKind] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deadline_stops_at_boundary_and_remains_expired() {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let state = StopState::new(deadline);
+        state.check_deadline(deadline - Duration::from_nanos(1));
+        assert!(!state.is_requested());
+        state.check_deadline(deadline);
+        assert!(state.is_requested());
+        assert!(state.did_timeout());
+        state.request_stop();
+        state.check_deadline(deadline + Duration::from_secs(1));
+        assert!(state.did_timeout());
+    }
+
+    #[test]
+    fn manual_stop_retains_its_reason_after_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let state = StopState::new(deadline);
+        state.request_stop();
+        state.check_deadline(deadline + Duration::from_secs(1));
+        assert!(state.is_requested());
+        assert!(!state.did_timeout());
+    }
 
     #[test]
     fn log_buffer_capacity() {

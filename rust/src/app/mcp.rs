@@ -48,7 +48,7 @@ impl ClumsyMagiApp {
                         self.mcp_copied_at = None;
                         if active {
                             self.mcp.take();
-                            if self.mcp_deadline.is_some() {
+                            if self.mcp_started {
                                 self.stop_filtering();
                             }
                         } else {
@@ -71,8 +71,7 @@ impl ClumsyMagiApp {
                                     self.mark_dirty();
                                     // Reopen capture so an existing manual run also excludes the control connection.
                                     if self.engine.as_ref().is_some_and(|engine| engine.is_running()) {
-                                        self.stop_filtering();
-                                        self.start_filtering();
+                                        self.restart_filtering();
                                     }
                                 }
                                 Err(e) => self.mcp_error = Some(e),
@@ -128,7 +127,7 @@ impl ClumsyMagiApp {
         if self.mcp.as_ref().is_some_and(|server| !server.is_running()) {
             self.mcp.take();
             self.mcp_error = Some("MCP listener stopped. Enable it to reconnect.".into());
-            if self.mcp_deadline.is_some() {
+            if self.mcp_started {
                 self.stop_filtering();
             }
         }
@@ -161,7 +160,7 @@ impl ClumsyMagiApp {
                 Ok(
                     json!({"running":running,"filter":config.filter,"capture_filter":self.mcp.as_ref().map(|server|crate::mcp::capture_filter(&config.filter,server.port)),"modules":config.modules,"target_pid":self.target_pid,
                     "driver_available":self.lib.is_some(),"elevated":self.elevated,"status":self.status,
-                    "remaining_secs":self.mcp_deadline.map(|t| t.saturating_duration_since(Instant::now()).as_secs())}),
+                    "remaining_secs":self.engine.as_ref().filter(|e| e.is_running()).map(|e| e.deadline().saturating_duration_since(Instant::now()).as_secs())}),
                 )
             }
             "get_stats" => {
@@ -299,13 +298,12 @@ impl ClumsyMagiApp {
                 if self.target_pid.is_some() {
                     self.update_target_filter(false);
                 }
-                self.start_filtering();
+                let deadline = Instant::now() + Duration::from_secs(args["duration_secs"].as_u64().unwrap());
+                self.start_filtering_until(deadline);
                 if self.engine.is_none() {
                     return Err(self.status.clone());
                 }
-                self.mcp_deadline = Some(
-                    Instant::now() + Duration::from_secs(args["duration_secs"].as_u64().unwrap()),
-                );
+                self.mcp_started = true;
                 self.mcp_tool("get_status", &json!({}))
             }
             "stop" => {

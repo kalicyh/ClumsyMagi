@@ -75,6 +75,15 @@ To capture system-wide network packets, ClumsyMagi must be run with Administrato
 .\target\release\clumsymagi.exe
 ```
 
+Filtering started with **Start**, **Quick Lag**, or CLI `--auto-start` stops after
+5 minutes by default. Select 10 minutes before starting for a longer test; this
+preference is saved. The engine thread enforces the deadline even if the remote
+connection is lost or GUI updates pause. Filtering stops while the application
+stays open, and automatic port-tracking restarts retain the original deadline.
+
+MCP `start` still requires `duration_secs` (1–3600 seconds), which replaces the
+saved GUI duration for that test and is enforced by the same engine timer.
+
 If launched from a normal user prompt, ClumsyMagi will open with a prominent **"🛡 Restart as Administrator"** button.
 
 ### Command-Line Arguments

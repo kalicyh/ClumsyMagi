@@ -30,6 +30,7 @@ ClumsyMagi preserves the functionality of original clumsy while introducing mode
 
 - **Process and Window Targeting**: Select any running game, application, or top-level window from an interactive dropdown. ClumsyMagi automatically enumerates and live-tracks its active UDP and TCP socket ports, synthesizing targeted capture filters on the fly.
 - **One-Click Quick Lag**: Instantly enable outbound latency (default 100 ms) on the targeted process without manually authoring or editing filter syntax.
+- **Automatic Stop**: GUI starts, Quick Lag and CLI `--auto-start` runs stop filtering after 5 minutes by default. Choose 10 minutes before starting for a longer test. The saved setting applies to later runs; the application stays open when filtering stops.
 - **Theme Engine**: Built-in support for **Dark**, **Light**, and **System** themes. System mode dynamically synchronizes with Windows Personalization settings (`AppsUseLightTheme`), backed by hardware-accelerated OpenGL clear-color buffers.
 - **Vector UI Graphics**: Clean, resolution-independent vector icons that automatically adapt their rendering color to match the active theme.
 - **Display Work-Area Centering**: Automatically calculates the primary display's usable work area (accounting for multi-monitor setups, taskbars, and DPI scaling) so the window opens centered on launch and maintains its position across UAC elevation restarts.
@@ -171,8 +172,10 @@ are rejected before applying a module update. MCP parameter changes use the same
 live parameters and persistence as manual GUI edits. Multi-field updates are not
 an atomic packet-processing transaction.
 
-An AI-started test stops when its deadline is processed by the GUI, when MCP is
-disabled, or when the window closes normally. Disconnecting an AI client leaves
+An AI-started test uses its required `duration_secs` (1–3600 seconds) instead of
+the GUI's saved 5/10-minute setting. The engine thread enforces the deadline
+independently of GUI updates or the AI connection. The test also stops when MCP
+is disabled or when the window closes normally. Disconnecting an AI client leaves
 the test running until its deadline. Process tracking retains the deadline when
 ports change; it stops capture if the target has no active sockets. Process
 selection generates port-based filters and is not strict process isolation when

@@ -8,12 +8,37 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Theme {
     System,
     Dark,
     Light,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoStop {
+    #[default]
+    FiveMinutes,
+    TenMinutes,
+}
+
+impl AutoStop {
+    pub fn duration(self) -> Duration {
+        Duration::from_secs(match self {
+            Self::FiveMinutes => 300,
+            Self::TenMinutes => 600,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FiveMinutes => "5 min",
+            Self::TenMinutes => "10 min",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +217,8 @@ pub struct AppConfig {
     pub modules: std::collections::BTreeMap<String, ModuleConfig>,
     /// start filtering immediately on launch (also set by --auto-start)
     pub auto_start: bool,
+    #[serde(default)]
+    pub auto_stop: AutoStop,
     pub show_log: bool,
     #[serde(default = "default_mcp_port")]
     pub mcp_port: u16,
@@ -217,6 +244,7 @@ impl Default for AppConfig {
             presets: builtin_presets(),
             modules: Default::default(),
             auto_start: false,
+            auto_stop: AutoStop::default(),
             show_log: true,
             mcp_port: default_mcp_port(),
             mcp_token: String::new(),
@@ -336,4 +364,35 @@ pub fn save(cfg: &AppConfig) -> Result<(), String> {
     std::fs::write(&tmp, text).map_err(|e| format!("write: {e}"))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_config_defaults_to_five_minute_auto_stop() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("auto_stop");
+        value["filter"] = serde_json::json!("tcp and outbound");
+
+        let config: AppConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config.auto_stop, AutoStop::FiveMinutes);
+        assert_eq!(config.auto_stop.duration(), Duration::from_secs(300));
+        assert_eq!(config.filter, "tcp and outbound");
+    }
+
+    #[test]
+    fn ten_minute_auto_stop_survives_config_round_trip() {
+        let config = AppConfig {
+            auto_stop: AutoStop::TenMinutes,
+            ..AppConfig::default()
+        };
+        let value = serde_json::to_value(config).unwrap();
+        assert_eq!(value["auto_stop"], "ten_minutes");
+
+        let restored: AppConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.auto_stop, AutoStop::TenMinutes);
+        assert_eq!(restored.auto_stop.duration(), Duration::from_secs(600));
+    }
 }
