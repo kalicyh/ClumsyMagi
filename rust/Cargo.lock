@@ -603,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "clumsymagi"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "dirs",
  "eframe",

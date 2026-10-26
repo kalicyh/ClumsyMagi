@@ -181,7 +181,8 @@ impl Drop for Server {
 }
 
 pub fn capture_filter(filter: &str, port: u16) -> String {
-    format!("({filter}) and not (tcp and (tcp.SrcPort == {port} or tcp.DstPort == {port}))")
+    // WinDivert only supports negating individual tests, not grouped filters.
+    format!("({filter}) and (not tcp or (tcp.SrcPort != {port} and tcp.DstPort != {port}))")
 }
 
 fn valid_host(host: Ipv4Addr) -> bool {
@@ -436,7 +437,7 @@ mod tests {
     fn control_port_is_excluded_from_impairment_filter() {
         assert_eq!(
             capture_filter("udp or tcp", 39761),
-            "(udp or tcp) and not (tcp and (tcp.SrcPort == 39761 or tcp.DstPort == 39761))"
+            "(udp or tcp) and (not tcp or (tcp.SrcPort != 39761 and tcp.DstPort != 39761))"
         );
     }
     #[test]

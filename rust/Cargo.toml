@@ -1,6 +1,6 @@
 [package]
 name = "clumsymagi"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 rust-version = "1.95"
 description = "ClumsyMagi - makes your network condition on Windows significantly worse, in a managed and interactive manner. Rust+egui remake of clumsy."
