@@ -1,9 +1,11 @@
-//! Stdio MCP bridge to the GUI's authenticated, loopback-only command queue.
+//! Authenticated Streamable HTTP MCP service and optional local stdio bridge.
+#[path = "mcp/http.rs"]
+mod http;
 use serde_json::{json, Value};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc, Arc,
 };
 use std::time::Duration;
@@ -17,53 +19,130 @@ pub struct Command {
 pub struct Server {
     pub port: u16,
     pub token: String,
+    pub host: Ipv4Addr,
     pub commands: mpsc::Receiver<Command>,
     stop: Arc<AtomicBool>,
 }
 
 impl Server {
-    pub fn start(port: u16, token: String) -> Result<Self, String> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).map_err(|e| e.to_string())?;
+    pub fn start(port: u16, token: String, lan: bool, host: Ipv4Addr) -> Result<Self, String> {
+        if token.len() < 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(
+                "MCP requires an access token of at least 32 hexadecimal characters".into(),
+            );
+        }
+        if !valid_host(host) || (lan && host.is_loopback()) {
+            return Err("Enter the Windows LAN IPv4 address before enabling remote access".into());
+        }
+        let bind = if lan {
+            Ipv4Addr::UNSPECIFIED
+        } else {
+            Ipv4Addr::LOCALHOST
+        };
+        let host = if lan { host } else { Ipv4Addr::LOCALHOST };
+        let listener = TcpListener::bind((bind, port)).map_err(|e| e.to_string())?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let (tx, commands) = mpsc::sync_channel(8);
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let secret = token.clone();
+        let authorities = vec![
+            format!("{host}:{port}"),
+            format!("127.0.0.1:{port}"),
+            format!("localhost:{port}"),
+        ];
+        let workers = Arc::new(AtomicUsize::new(0));
         std::thread::Builder::new()
             .name("clumsymagi-mcp".into())
             .spawn(move || {
                 while !stopped.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                            let envelope = read_message(&mut BufReader::new(&mut stream));
-                            if stopped.load(Ordering::SeqCst) {
-                                break;
+                            if workers.fetch_add(1, Ordering::SeqCst) >= 16 {
+                                workers.fetch_sub(1, Ordering::SeqCst);
+                                continue;
                             }
-                            let response = match envelope {
-                                Ok(v) if v["token"].as_str() == Some(secret.as_str()) => {
-                                    let (reply, rx) = mpsc::sync_channel(1);
-                                    if tx
-                                        .try_send(Command {
-                                            request: v["request"].clone(),
-                                            reply,
-                                            expires: std::time::Instant::now()
-                                                + Duration::from_secs(8),
-                                        })
-                                        .is_err()
-                                    {
-                                        json!({"bridgeError":"MCP is busy or disabled"})
-                                    } else {
-                                        rx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(
-                                            |_| json!({"bridgeError":"GUI request timed out"}),
-                                        )
+                            let active = workers.clone();
+                            let tx = tx.clone();
+                            let secret = secret.clone();
+                            let authorities = authorities.clone();
+                            let stop = stopped.clone();
+                            let task = std::thread::Builder::new()
+                                .name("clumsymagi-mcp-http".into())
+                                .spawn(move || {
+                                    struct Worker(Arc<AtomicUsize>);
+                                    impl Drop for Worker {
+                                        fn drop(&mut self) {
+                                            self.0.fetch_sub(1, Ordering::SeqCst);
+                                        }
                                     }
-                                }
-                                _ => json!({"bridgeError":"Invalid MCP credentials or message"}),
-                            };
-                            let _ = writeln!(stream, "{response}");
+                                    let _worker = Worker(active);
+                                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                                    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                                    struct TimedRead<'a> {
+                                        stream: &'a mut TcpStream,
+                                        deadline: std::time::Instant,
+                                    }
+                                    impl Read for TimedRead<'_> {
+                                        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                                            if std::time::Instant::now() >= self.deadline {
+                                                return Err(io::Error::new(
+                                                    io::ErrorKind::TimedOut,
+                                                    "HTTP request deadline exceeded",
+                                                ));
+                                            }
+                                            self.stream.read(bytes)
+                                        }
+                                    }
+                                    let request =
+                                        http::read_request(&mut BufReader::new(TimedRead {
+                                            stream: &mut stream,
+                                            deadline: std::time::Instant::now()
+                                                + Duration::from_secs(5),
+                                        }));
+                                    let response = match request {
+                                        Ok(request) => http::handle(
+                                            request,
+                                            &secret,
+                                            &authorities,
+                                            |message| {
+                                                if stop.load(Ordering::SeqCst) {
+                                                    return Err(http::Response::error(
+                                                        503,
+                                                        "MCP disabled",
+                                                    ));
+                                                }
+                                                let (reply, rx) = mpsc::sync_channel(1);
+                                                tx.try_send(Command {
+                                                    request: message,
+                                                    reply,
+                                                    expires: std::time::Instant::now()
+                                                        + Duration::from_secs(8),
+                                                })
+                                                .map_err(|_| {
+                                                    http::Response::error(
+                                                        503,
+                                                        "MCP busy or disabled",
+                                                    )
+                                                })?;
+                                                rx.recv_timeout(Duration::from_secs(10)).map_err(
+                                                    |_| {
+                                                        http::Response::error(
+                                                            504,
+                                                            "GUI request timed out",
+                                                        )
+                                                    },
+                                                )
+                                            },
+                                        ),
+                                        Err(error) => error,
+                                    };
+                                    let _ = response.write(&mut stream);
+                                });
+                            if task.is_err() {
+                                workers.fetch_sub(1, Ordering::SeqCst);
+                            }
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(25))
@@ -77,6 +156,7 @@ impl Server {
         Ok(Self {
             port,
             token,
+            host,
             commands,
             stop,
         })
@@ -86,19 +166,43 @@ impl Server {
         !self.stop.load(Ordering::SeqCst)
     }
 
+    pub fn endpoint(&self) -> String {
+        format!("http://{}:{}/mcp", self.host, self.port)
+    }
+
     pub fn client_config(&self) -> Result<String, String> {
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        serde_json::to_string_pretty(&json!({"mcpServers":{"clumsymagi":{
-            "command":exe, "args":["--mcp", "--mcp-port", self.port.to_string()],
-            "env":{"CLUMSYMAGI_MCP_TOKEN":self.token}
-        }}}))
-        .map_err(|e| e.to_string())
+        remote_config(&self.endpoint(), &self.token)
     }
 }
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
     }
+}
+
+pub fn capture_filter(filter: &str, port: u16) -> String {
+    format!("({filter}) and not (tcp and (tcp.SrcPort == {port} or tcp.DstPort == {port}))")
+}
+
+fn valid_host(host: Ipv4Addr) -> bool {
+    !host.is_unspecified() && !host.is_multicast() && !host.is_broadcast() && host.octets()[0] != 0
+}
+
+pub fn detect_lan_host() -> Option<Ipv4Addr> {
+    // UDP connect chooses the default interface without sending a packet.
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 80)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if valid_host(ip) && !ip.is_loopback() => Some(ip),
+        _ => None,
+    }
+}
+
+fn remote_config(endpoint: &str, token: &str) -> Result<String, String> {
+    serde_json::to_string_pretty(&json!({"mcpServers":{"clumsymagi":{
+        "url":endpoint,"headers":{"Authorization":format!("Bearer {token}")}
+    }}}))
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(windows)]
@@ -168,13 +272,9 @@ pub fn bridge(args: &[String]) -> Result<(), String> {
         stream
             .set_write_timeout(Some(Duration::from_secs(2)))
             .map_err(|e| e.to_string())?;
-        writeln!(stream, "{}", json!({"token":token,"request":request}))
-            .map_err(|e| e.to_string())?;
-        let response = read_message(&mut BufReader::new(stream)).map_err(|e| e.to_string())?;
-        if let Some(error) = response["bridgeError"].as_str() {
-            return Err(error.into());
-        }
-        if !response.is_null() {
+        let body = request.to_string();
+        write!(stream,"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).map_err(|e|e.to_string())?;
+        if let Some(response) = http::read_response(&mut BufReader::new(stream))? {
             writeln!(output, "{response}").map_err(|e| e.to_string())?;
             output.flush().map_err(|e| e.to_string())?;
         }
@@ -333,45 +433,24 @@ mod tests {
         assert!(read_message(&mut large.as_slice()).is_err());
     }
     #[test]
-    fn authenticated_requests_reach_gui_and_invalid_tokens_do_not() {
-        let server = Server::start(0, "test-secret".into()).unwrap();
-        let port = server.port;
-        let send = |token: &str| {
-            let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .unwrap();
-            writeln!(
-                stream,
-                "{}",
-                json!({"token":token,"request":{"jsonrpc":"2.0","id":7,"method":"ping"}})
-            )
-            .unwrap();
-            read_message(&mut BufReader::new(stream)).unwrap()
-        };
-        assert!(send("wrong")["bridgeError"].is_string());
-        assert!(server.commands.try_recv().is_err());
-        std::thread::scope(|scope| {
-            let client = scope.spawn(|| send("test-secret"));
-            let command = server
-                .commands
-                .recv_timeout(Duration::from_secs(3))
-                .unwrap();
-            assert_eq!(command.request["id"], 7);
-            command
-                .reply
-                .send(json!({"jsonrpc":"2.0","id":7,"result":{}}))
-                .unwrap();
-            assert_eq!(client.join().unwrap()["id"], 7);
-        });
-        let config: Value = serde_json::from_str(&server.client_config().unwrap()).unwrap();
+    fn control_port_is_excluded_from_impairment_filter() {
         assert_eq!(
-            config["mcpServers"]["clumsymagi"]["env"]["CLUMSYMAGI_MCP_TOKEN"],
-            "test-secret"
+            capture_filter("udp or tcp", 39761),
+            "(udp or tcp) and not (tcp and (tcp.SrcPort == 39761 or tcp.DstPort == 39761))"
         );
-        let stopped = server.stop.clone();
-        drop(server);
-        assert!(stopped.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn remote_config_is_usable_without_a_windows_executable() {
+        let config: Value = serde_json::from_str(
+            &remote_config("http://192.168.1.10:39761/mcp", "test-secret").unwrap(),
+        )
+        .unwrap();
+        let server = &config["mcpServers"]["clumsymagi"];
+        assert_eq!(server["url"], "http://192.168.1.10:39761/mcp");
+        assert_eq!(server["headers"]["Authorization"], "Bearer test-secret");
+        assert!(server.get("command").is_none());
+        assert!(!valid_host(Ipv4Addr::UNSPECIFIED));
+        assert!(!valid_host(Ipv4Addr::BROADCAST));
     }
     #[test]
     fn protocol_handshake_discovery_and_tool_errors() {

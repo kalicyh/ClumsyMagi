@@ -197,7 +197,13 @@ pub struct AppConfig {
     pub mcp_port: u16,
     #[serde(default)]
     pub mcp_token: String,
+    #[serde(default = "default_mcp_lan")]
+    pub mcp_lan: bool,
+    #[serde(default)]
+    pub mcp_host: String,
 }
+
+fn default_mcp_lan() -> bool { true }
 
 fn default_mcp_port() -> u16 {
     39761
@@ -214,6 +220,8 @@ impl Default for AppConfig {
             show_log: true,
             mcp_port: default_mcp_port(),
             mcp_token: String::new(),
+            mcp_lan: true,
+            mcp_host: String::new(),
         }
     }
 }

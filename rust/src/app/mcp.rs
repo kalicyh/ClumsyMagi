@@ -58,13 +58,22 @@ impl ClumsyMagiApp {
                                 Ok(self.config.mcp_token.clone())
                             };
                             match token.and_then(|token| {
-                                crate::mcp::Server::start(self.config.mcp_port, token)
+                                let host = if self.config.mcp_lan {
+                                    self.config.mcp_host.parse::<std::net::Ipv4Addr>()
+                                        .map_err(|_| "Enter the Windows LAN IPv4 address".to_string())?
+                                } else { std::net::Ipv4Addr::LOCALHOST };
+                                crate::mcp::Server::start(self.config.mcp_port, token, self.config.mcp_lan, host)
                             }) {
                                 Ok(server) => {
                                     self.config.mcp_port = server.port;
                                     self.config.mcp_token = server.token.clone();
                                     self.mcp = Some(server);
                                     self.mark_dirty();
+                                    // Reopen capture so an existing manual run also excludes the control connection.
+                                    if self.engine.as_ref().is_some_and(|engine| engine.is_running()) {
+                                        self.stop_filtering();
+                                        self.start_filtering();
+                                    }
                                 }
                                 Err(e) => self.mcp_error = Some(e),
                             }
@@ -73,25 +82,40 @@ impl ClumsyMagiApp {
                 });
             });
             ui.horizontal(|ui| {
-                ui.weak("Local port");
-                if ui
-                    .add_enabled(
-                        self.mcp.is_none(),
-                        egui::DragValue::new(&mut self.config.mcp_port).range(1024..=65535),
-                    )
-                    .changed()
-                {
-                    self.mark_dirty();
-                }
-                ui.weak("Controls this window. Off on every launch.");
+                ui.add_enabled_ui(self.mcp.is_none(), |ui| {
+                    if ui.selectable_value(&mut self.config.mcp_lan, false, "This PC").changed() { self.mark_dirty(); }
+                    if ui.selectable_value(&mut self.config.mcp_lan, true, "LAN / VPN").changed() { self.mark_dirty(); }
+                    ui.separator();
+                    ui.label("Port");
+                    if ui.add(egui::DragValue::new(&mut self.config.mcp_port).range(1024..=65535)).changed() { self.mark_dirty(); }
+                });
             });
+            if self.config.mcp_lan {
+                ui.horizontal(|ui| {
+                    ui.label("Windows IP");
+                    ui.add_enabled_ui(self.mcp.is_none(), |ui| {
+                        if ui.add(egui::TextEdit::singleline(&mut self.config.mcp_host).desired_width(140.0).hint_text("LAN IPv4 address")).changed() { self.mark_dirty(); }
+                        if ui.button("Detect").clicked() {
+                            match crate::mcp::detect_lan_host() {
+                                Some(host) => { self.config.mcp_host = host.to_string(); self.mark_dirty(); self.mcp_error = None; }
+                                None => self.mcp_error = Some("Could not detect an address. Enter the Windows LAN or VPN IPv4 address.".into()),
+                            }
+                        }
+                    });
+                });
+                ui.label(egui::RichText::new("HTTP on trusted LAN / VPN only. Access token required.").small().weak());
+            }
+            if let Some(server) = &self.mcp {
+                ui.monospace(server.endpoint());
+                ui.label(egui::RichText::new("MCP TCP port is excluded from capture.").small().weak());
+            }
             if let Some(e) = &self.mcp_error {
                 ui.colored_label(error_color(ui), e);
             }
             if self.mcp.is_some() {
                 ui.label(
                     egui::RichText::new(
-                        "Paste config into your MCP client. Keep this window open.",
+                        "Copy to your Mac MCP client. Keep this window open.",
                     )
                     .small()
                     .weak(),
@@ -135,7 +159,7 @@ impl ClumsyMagiApp {
                 let mut config = self.config.clone();
                 config.sync_from_params(&self.params);
                 Ok(
-                    json!({"running":running,"filter":config.filter,"modules":config.modules,"target_pid":self.target_pid,
+                    json!({"running":running,"filter":config.filter,"capture_filter":self.mcp.as_ref().map(|server|crate::mcp::capture_filter(&config.filter,server.port)),"modules":config.modules,"target_pid":self.target_pid,
                     "driver_available":self.lib.is_some(),"elevated":self.elevated,"status":self.status,
                     "remaining_secs":self.mcp_deadline.map(|t| t.saturating_duration_since(Instant::now()).as_secs())}),
                 )

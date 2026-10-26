@@ -96,31 +96,61 @@ The **MCP Automation** group in the desktop window controls AI access to that sa
 window's filtering engine. It uses the existing theme, grouped controls and status
 colors. No separate filtering instance is launched.
 
-1. Open ClumsyMagi (as Administrator for packet capture).
-2. Click **Enable** under **MCP Automation**. The status changes to **Running** only
-   after the local listener starts successfully.
-3. Click **Copy Config** and paste the JSON into a client that supports the
-   `mcpServers` configuration format and stdio servers. Clients with a different
-   settings format need the same `command`, `args` and `env` values.
-4. Keep the window open. Ask the AI to select a process or set a filter, configure
-   modules, and start a timed test.
+1. Open ClumsyMagi on Windows (as Administrator for packet capture).
+2. In **MCP Automation**, select **LAN / VPN**, check **Windows IP**, and click
+   **Enable**. **Detect** selects the default IPv4 interface; enter the Windows VPN
+   or LAN IPv4 address manually when another interface is needed. The service
+   listens on all IPv4 interfaces in this mode; the displayed IP is the address
+   clients use, not an interface binding restriction.
+3. Click **Copy Config** and paste it into a Mac MCP client supporting
+   **Streamable HTTP**, Bearer headers and the `mcpServers` JSON format. Clients
+   with other settings formats need the same URL and Authorization header.
+4. Keep the Windows window open. The Mac sends commands to that window's engine;
+   it does not launch or install the Windows executable.
 5. Click **Disable** to revoke access and stop an AI-started filtering run. A run
    started manually in the GUI is not stopped by disabling MCP.
 
-The service is **off on every application launch**. Its local port (default 39761)
-can be edited while disabled. Port and access token are saved with the application's
-configuration, so copied settings remain usable across restarts at the same
-executable path. Enable the service again before reconnecting the client. After
-changing the port or moving the executable, copy the configuration again. If a
-client disconnected while MCP was disabled, reconnect/restart its server entry.
-The copied configuration contains an access token; treat it as a credential.
+Example only: replace the Windows IP and token with those from **Copy Config**:
 
-The client starts `clumsymagi.exe --mcp --mcp-port <PORT>` as a stdio bridge, with
-`CLUMSYMAGI_MCP_TOKEN` in its environment. This mode bypasses GUI initialization and
-the single-instance check, and forwards newline-delimited JSON-RPC messages over an
-authenticated, loopback-only connection. It does not open another window or require
-Node.js/Python. The internal TCP port is not an HTTP MCP endpoint.
-See the [MCP stdio transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports).
+```json
+{
+  "mcpServers": {
+    "clumsymagi": {
+      "url": "http://192.168.1.10:39761/mcp",
+      "headers": { "Authorization": "Bearer <your-access-token>" }
+    }
+  }
+}
+```
+
+Use **This PC** for loopback-only access instead. The service is **off on every
+application launch**. Scope, advertised IP, port (default 39761) and token are saved
+in the application config. Enable the service before reconnecting. Copy the config
+again after changing the address, port or token. There is no executable path in the
+remote config, so moving the Windows application does not change the Mac settings.
+The copied configuration contains a credential; keep it private.
+
+The built-in endpoint uses HTTP, intended for a **trusted LAN or VPN**. It does not
+provide TLS, OAuth, browser access or public Internet hosting. All requests require
+a Bearer token; browser Origin headers and unadvertised Host headers are rejected.
+Use the displayed literal IPv4 URL. If Windows Firewall blocks access, allow TCP on
+the chosen port for the intended private network/client; the application does not
+modify firewall rules. Do not use router port forwarding to publish this HTTP
+endpoint to the Internet.
+
+This is a stateless [MCP Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports):
+POST requests return JSON; accepted notifications return HTTP 202. GET and DELETE
+return 405 because there are no SSE streams or session IDs. The optional legacy
+local bridge (`clumsymagi.exe --mcp --mcp-port <PORT>`, with
+`CLUMSYMAGI_MCP_TOKEN` in its environment) forwards stdio messages to the same HTTP
+endpoint on loopback. It remains available for older Windows-only configurations.
+
+The MCP TCP port is excluded from capture while the service is enabled so test
+impairments do not interrupt control requests. Enabling MCP during a manual run
+restarts capture to apply this exclusion (resetting engine counters); after disabling
+MCP, an existing manual run retains its exclusion until the next restart. Tests
+must use a different port. The requested filter remains visible in the GUI;
+`get_status.capture_filter` reports the exclusion while MCP is enabled.
 
 Available tools:
 

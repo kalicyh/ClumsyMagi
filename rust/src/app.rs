@@ -76,7 +76,12 @@ pub struct ClumsyMagiApp {
 }
 
 impl ClumsyMagiApp {
-    pub fn new(config: AppConfig, lib: Result<Arc<WinDivertLib>, String>, elevated: bool) -> Self {
+    pub fn new(mut config: AppConfig, lib: Result<Arc<WinDivertLib>, String>, elevated: bool) -> Self {
+        if config.mcp_host.is_empty() {
+            if let Some(host) = crate::mcp::detect_lan_host() {
+                config.mcp_host = host.to_string();
+            }
+        }
         let preset_selected = config
             .presets
             .iter()
@@ -158,7 +163,8 @@ impl ClumsyMagiApp {
             );
             return;
         };
-        let filter = self.config.filter.clone();
+        let filter = self.mcp.as_ref().map(|server| crate::mcp::capture_filter(&self.config.filter, server.port))
+            .unwrap_or_else(|| self.config.filter.clone());
         let params = self.params.clone();
         match EngineHandle::start(lib, &filter, params) {
             Ok(engine) => {
